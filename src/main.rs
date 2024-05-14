@@ -15,7 +15,7 @@ use hyper::{
     upgrade::Upgraded, Method, Request, Response,
 };
 use hyper_util::rt::TokioIo;
-use log::{error, info};
+use log::{debug, error, info, warn};
 use server::util::target_addr::TargetAddr;
 use std::net::ToSocketAddrs;
 use tokio::{fs::File, io::AsyncWriteExt, net::TcpSocket};
@@ -46,6 +46,9 @@ async fn main() -> anyhow::Result<()> {
     let mut hasher = DefaultHasher::new();
     for inet in cidr.iter().skip(1) {
         let address = inet.address();
+        if address.is_broadcast() {
+            continue;
+        }
         let num: u32 = address.into();
         hasher.write_u32(num);
 
@@ -164,7 +167,7 @@ async fn run_http(
                 .with_upgrades()
                 .await
             {
-                println!("Failed to serve connection: {:?}", err);
+                warn!("Failed to serve connection: {:?}", err);
             }
         });
     }
@@ -213,6 +216,7 @@ impl Service<Request<hyper::body::Incoming>> for ProxyService {
                 Some(session) => {
                     let source_addr = IpAddr::V4(session.address);
                     if Method::CONNECT == req.method() {
+                        info!("Running CONNECT based HTTP stream");
                         // Received an HTTP request like:
                         // ```
                         // CONNECT www.domain.com:443 HTTP/1.1
@@ -251,16 +255,16 @@ impl Service<Request<hyper::body::Incoming>> for ProxyService {
                                         if let Err(e) =
                                             tunnel(upgraded, target_addr_socket, source_addr).await
                                         {
-                                            eprintln!("server io error: {}", e);
+                                            error!("server io error: {}", e);
                                         };
                                     }
-                                    Err(e) => eprintln!("upgrade error: {}", e),
+                                    Err(e) => error!("upgrade error: {}", e),
                                 }
                             });
 
                             Ok(Response::new(empty()))
                         } else {
-                            eprintln!("CONNECT host is not socket addr: {:?}", req.uri());
+                            error!("CONNECT host is not socket addr: {:?}", req.uri());
                             let mut resp =
                                 Response::new(full("CONNECT must be to a socket address"));
                             *resp.status_mut() = http::StatusCode::BAD_REQUEST;
@@ -268,6 +272,7 @@ impl Service<Request<hyper::body::Incoming>> for ProxyService {
                             Ok(resp)
                         }
                     } else {
+                        info!("Running direct HTTP request");
                         let host = req.uri().host().expect("uri has no host");
                         let port = req.uri().port_u16().unwrap_or(80);
                         let target_addr = match host.parse::<IpAddr>() {
@@ -319,7 +324,7 @@ impl Service<Request<hyper::body::Incoming>> for ProxyService {
                             .unwrap();
                         tokio::task::spawn(async move {
                             if let Err(err) = conn.await {
-                                println!("Connection failed: {:?}", err);
+                                error!("Connection failed: {:?}", err);
                             }
                         });
 
@@ -345,6 +350,7 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
 }
 
 async fn tunnel(upgraded: Upgraded, addr: SocketAddr, source_addr: IpAddr) -> std::io::Result<()> {
+    debug!("Tunneling {} to {}", addr, source_addr);
     let socket = match source_addr {
         IpAddr::V4(addr) => {
             let socket = TcpSocket::new_v4().unwrap();
@@ -372,7 +378,7 @@ async fn tunnel(upgraded: Upgraded, addr: SocketAddr, source_addr: IpAddr) -> st
     let (from_client, from_server) =
         tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
 
-    println!(
+    debug!(
         "client wrote {} bytes and received {} bytes",
         from_client, from_server
     );
