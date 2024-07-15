@@ -46,7 +46,6 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Mutex::new(rusqlite::Connection::open_with_flags(
         args.database,
         OpenFlags::empty()
-            .intersection(OpenFlags::SQLITE_OPEN_CREATE)
             .intersection(OpenFlags::SQLITE_OPEN_READ_ONLY)
             .intersection(OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .intersection(OpenFlags::SQLITE_OPEN_URI),
