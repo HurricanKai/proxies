@@ -45,7 +45,10 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::<()>::new();
     let db = Arc::new(Mutex::new(rusqlite::Connection::open_with_flags(
         args.database,
-        OpenFlags::empty().intersection(OpenFlags::SQLITE_OPEN_READ_ONLY),
+        OpenFlags::empty()
+            .union(OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .union(OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .union(OpenFlags::SQLITE_OPEN_URI),
     )?));
 
     // CREATE TABLE IF NOT EXISTS proxies (
