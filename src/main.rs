@@ -1,14 +1,14 @@
 #![forbid(unsafe_code)]
 use std::{
-    collections::HashMap,
     future::Future,
-    hash::{DefaultHasher, Hasher},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
     pin::Pin,
     sync::Arc,
 };
 
 use base64::Engine;
+use clap::Parser;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::{
     body::Bytes, client::conn::http1::Builder, server::conn::http1, service::Service,
@@ -16,65 +16,76 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use log::{debug, error, info, warn};
+use rusqlite::{Connection, OpenFlags};
 use server::util::target_addr::TargetAddr;
 use std::net::ToSocketAddrs;
-use tokio::{fs::File, io::AsyncWriteExt, net::TcpSocket};
+use tokio::{net::TcpSocket, sync::Mutex};
 use tokio_stream::StreamExt;
 
 use crate::server::{DynamicUserPassword, IpSessionInfo, User};
 
 pub mod server;
 
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    #[arg(short, long)]
+    database: PathBuf,
+
+    #[arg(short, long)]
+    listen: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    info!("Calculating Users...");
-
-    let mut csv_file = File::create("/tmp/users.csv").await.unwrap();
-
-    csv_file
-        .write_all("username,password,address,port\n".as_bytes())
-        .await
-        .unwrap();
-
-    let cidr = cidr::Ipv4Cidr::new(Ipv4Addr::new(89, 36, 34, 128), 25).unwrap();
-
-    let mut allowed_users = HashMap::new();
-    let first_address = cidr.first_address();
-
-    let mut hasher = DefaultHasher::new();
-    for inet in cidr.iter().skip(1) {
-        let address = inet.address();
-        if address.is_broadcast() {
-            continue;
-        }
-        let num: u32 = address.into();
-        hasher.write_u32(num);
-
-        let username = format!("u_{num}");
-        let password = base64::prelude::BASE64_STANDARD.encode(hasher.finish().to_le_bytes());
-        info!("Generated User: http://{username}:{password}@{first_address}:1080");
-
-        allowed_users.insert(
-            username.clone(),
-            (password.clone(), IpSessionInfo { address }),
-        );
-        csv_file
-            .write_all(format!("{},\"{}\",{},1080\n", username, password, first_address).as_bytes())
-            .await
-            .unwrap();
-    }
-
-    let allowed_users = Arc::new(allowed_users);
-
-    info!("Starting Servers...");
+    let args = Cli::parse();
 
     let mut tasks = tokio::task::JoinSet::<()>::new();
+    let db = Arc::new(Mutex::new(rusqlite::Connection::open_with_flags(
+        args.database,
+        OpenFlags::empty()
+            .intersection(OpenFlags::SQLITE_OPEN_CREATE)
+            .intersection(OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .intersection(OpenFlags::SQLITE_OPEN_NO_MUTEX)
+            .intersection(OpenFlags::SQLITE_OPEN_URI),
+    )?));
 
-    tasks.spawn(run_socks5(first_address, allowed_users.clone()));
-    tasks.spawn(run_http(first_address, allowed_users.clone()));
+    {
+        let db = db.lock().await;
+        db.execute(
+            "
+        CREATE DATABASE IF NOT EXISTS proxies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            address TEXT NOT NULL,
+            username TEXT NOT NULL,
+            password TEXT NOT NULL,
+        );
+",
+            (),
+        )?;
+    }
 
+    for addr in args.listen.into_iter() {
+        if let Ok(url) = url::Url::parse(&addr) {
+            match url.scheme() {
+                "socks5" => {
+                    for addr in url.socket_addrs(|| Some(1080))? {
+                        tasks.spawn(run_socks5(addr, db.clone()));
+                    }
+                }
+                "http" => {
+                    for addr in url.socket_addrs(|| Some(8118))? {
+                        tasks.spawn(run_http(addr, db.clone()));
+                    }
+                }
+                x => {
+                    error!("Unknown schema {x}")
+                }
+            }
+        }
+    }
     info!("Waiting to exit...");
     while let Some(_) = tasks.join_next().await {}
     info!("All done! Bye");
@@ -82,15 +93,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_socks5(
-    listen_on: Ipv4Addr,
-    allowed_users: Arc<HashMap<String, (String, IpSessionInfo)>>,
-) {
-    let username = "user".to_string();
-    let password = "password".to_string();
-
-    let mut config =
-        server::Config::default().with_authentication(DynamicUserPassword::new(allowed_users));
+async fn run_socks5(listen_on: SocketAddr, db: Arc<Mutex<Connection>>) {
+    let mut config = server::Config::default().with_authentication(DynamicUserPassword::new(db));
 
     config.set_dns_resolve(true);
     config.set_udp_support(true);
@@ -98,8 +102,8 @@ async fn run_socks5(
 
     let config = config;
 
-    info!("Listening on http://{username}:{password}@{listen_on}:1080");
-    let server = server::Socks5Server::bind((listen_on, 1080))
+    info!("Listening on http://<user>:<password>@{listen_on}:1080");
+    let server = server::Socks5Server::bind(listen_on)
         .await
         .unwrap()
         .with_config(config);
@@ -141,18 +145,13 @@ async fn run_socks5(
     while let Some(_) = tasks.join_next().await {}
 }
 
-async fn run_http(
-    listen_on: Ipv4Addr,
-    allowed_users: Arc<HashMap<String, (String, IpSessionInfo)>>,
-) {
-    info!("Listening HTTP on {listen_on}:8118");
+async fn run_http(listen_on: SocketAddr, db: Arc<Mutex<Connection>>) {
+    info!("Listening HTTP on {listen_on}");
     let socket = TcpSocket::new_v4().unwrap();
-    socket.bind((listen_on, 8118).into()).unwrap();
+    socket.bind(listen_on).unwrap();
 
     let listener = socket.listen(16).unwrap();
-    let service = ProxyService {
-        allowed_users: allowed_users,
-    };
+    let service = ProxyService { db: db };
 
     loop {
         let (stream, _) = listener.accept().await.unwrap();
@@ -175,7 +174,7 @@ async fn run_http(
 
 #[derive(Debug, Clone)]
 struct ProxyService {
-    allowed_users: Arc<HashMap<String, (String, IpSessionInfo)>>,
+    db: Arc<Mutex<Connection>>,
 }
 
 impl Service<Request<hyper::body::Incoming>> for ProxyService {
@@ -184,37 +183,36 @@ impl Service<Request<hyper::body::Incoming>> for ProxyService {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {
-        let allowed_users = self.allowed_users.clone();
+        let db = self.db.clone();
         Box::pin(async move {
-            let auth =
-                req.headers()
-                    .get("Proxy-Authorization")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|h| h.split_once(' '))
-                    .and_then(|(method, value)| match method {
-                        "Basic" => base64::prelude::BASE64_STANDARD
-                            .decode(value)
-                            .ok()
-                            .and_then(|e| String::from_utf8(e).ok())
-                            .and_then(|e| {
-                                e.split_once(':').and_then(|(username, password)| {
-                                    allowed_users.get(username).and_then(
-                                        |(real_password, session)| match real_password == password {
-                                            true => Some(session),
-                                            false => None,
-                                        },
-                                    )
-                                })
-                            }),
-                        _ => None,
-                    });
+            let auth = req
+                .headers()
+                .get("Proxy-Authorization")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| h.split_once(' '))
+                .and_then(|(method, value)| match method {
+                    "Basic" => base64::prelude::BASE64_STANDARD
+                        .decode(value)
+                        .ok()
+                        .and_then(|e| String::from_utf8(e).ok())
+                        .and_then(|e| e.split_once(':').map(|(a, b)| (a.to_owned(), b.to_owned()))),
+                    _ => None,
+                });
+
+            let auth = if let Some((username, password)) = auth {
+                get_user(db.as_ref(), &username, &password)
+                    .await
+                    .unwrap_or_else(|_| None)
+            } else {
+                None
+            };
 
             match auth {
                 None => Response::builder()
                     .status(407)
                     .body(full("{ \"error\": \"Proxy Authorization Failed!\" }")),
                 Some(session) => {
-                    let source_addr = IpAddr::V4(session.address);
+                    let source_addr = session.address;
                     if Method::CONNECT == req.method() {
                         info!("Running CONNECT based HTTP stream");
                         // Received an HTTP request like:
@@ -384,4 +382,26 @@ async fn tunnel(upgraded: Upgraded, addr: SocketAddr, source_addr: IpAddr) -> st
     );
 
     Ok(())
+}
+
+pub async fn get_user(
+    db: &Mutex<Connection>,
+    username: &str,
+    password: &str,
+) -> Result<Option<IpSessionInfo>, anyhow::Error> {
+    let db = db.lock().await;
+
+    let r = (match db
+        .prepare_cached("SELECT address FROM proxies WHERE username = ?1 AND password = ?2")?
+        .query_row([username, password], |r| {
+            Ok(IpSessionInfo {
+                address: r.get::<&str, String>("address")?.parse().unwrap(),
+            })
+        }) {
+        Ok(x) => Ok(Some(x)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(x) => Err(x),
+    })?;
+
+    Ok(r)
 }

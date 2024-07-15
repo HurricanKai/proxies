@@ -8,6 +8,7 @@ use log::debug;
 use log::error;
 use log::info;
 use log::trace;
+use rusqlite::Connection;
 use socks5::new_udp_header;
 use socks5::parse_udp_request;
 use socks5::Socks5Command;
@@ -25,6 +26,7 @@ use std::task::{Context as AsyncContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs as AsyncToSocketAddrs};
+use tokio::sync::Mutex;
 use tokio::try_join;
 use tokio_stream::Stream;
 use util::stream::tcp_connect_with_timeout;
@@ -251,9 +253,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Socks5Socket<T> {
         }
 
         match self
-            .request(std::net::IpAddr::V4(
-                self.get_credentials().expect("TODO").value.address,
-            ))
+            .request(self.get_credentials().expect("TODO").value.address)
             .await
         {
             Ok(_) => {}
@@ -794,16 +794,16 @@ where
 
 #[derive(Clone, Debug)]
 pub struct IpSessionInfo {
-    pub address: Ipv4Addr,
+    pub address: IpAddr,
 }
 
 pub struct DynamicUserPassword {
-    allowed: Arc<HashMap<String, (String, IpSessionInfo)>>,
+    db: Arc<Mutex<Connection>>,
 }
 
 impl DynamicUserPassword {
-    pub fn new(allowed: Arc<HashMap<String, (String, IpSessionInfo)>>) -> Self {
-        DynamicUserPassword { allowed }
+    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+        DynamicUserPassword { db }
     }
 }
 
@@ -824,15 +824,11 @@ impl Deref for User {
 impl DynamicUserPassword {
     async fn authenticate(&self, credentials: Option<(String, String)>) -> Option<User> {
         if let Some((username, password)) = credentials {
-            if let Some((required_password, value)) = self.allowed.get(&username) {
-                if required_password == &password {
-                    Some(User {
-                        username,
-                        value: value.clone(),
-                    })
-                } else {
-                    None
-                }
+            if let Ok(Some(value)) = crate::get_user(self.db.as_ref(), &username, &password).await {
+                Some(User {
+                    username,
+                    value: value.clone(),
+                })
             } else {
                 None
             }
