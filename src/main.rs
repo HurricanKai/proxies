@@ -45,26 +45,15 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::<()>::new();
     let db = Arc::new(Mutex::new(rusqlite::Connection::open_with_flags(
         args.database,
-        OpenFlags::empty()
-            .intersection(OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .intersection(OpenFlags::SQLITE_OPEN_NO_MUTEX)
-            .intersection(OpenFlags::SQLITE_OPEN_URI),
+        OpenFlags::empty().intersection(OpenFlags::SQLITE_OPEN_READ_ONLY),
     )?));
 
-    {
-        let db = db.lock().await;
-        db.execute(
-            "
-        CREATE TABLE IF NOT EXISTS proxies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-            address TEXT NOT NULL,
-            username TEXT NOT NULL,
-            password TEXT NOT NULL
-        );
-",
-            (),
-        )?;
-    }
+    // CREATE TABLE IF NOT EXISTS proxies (
+    //     id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    //     address TEXT NOT NULL,
+    //     username TEXT NOT NULL,
+    //     password TEXT NOT NULL
+    // );
 
     for addr in args.listen.into_iter() {
         if let Ok(url) = url::Url::parse(&addr) {
