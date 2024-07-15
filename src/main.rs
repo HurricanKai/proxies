@@ -56,11 +56,11 @@ async fn main() -> anyhow::Result<()> {
         let db = db.lock().await;
         db.execute(
             "
-        CREATE DATABASE IF NOT EXISTS proxies (
+        CREATE TABLE IF NOT EXISTS proxies (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
             address TEXT NOT NULL,
             username TEXT NOT NULL,
-            password TEXT NOT NULL,
+            password TEXT NOT NULL
         );
 ",
             (),
